@@ -2,31 +2,42 @@ import random
 import time
 from enum import StrEnum
 
+from src.biome import BiomeEnum
+from src.climate import Climate
+
+
+class WeatherType(StrEnum):
+    Clear = "clear"
+    Cloudy = "cloudy"
+    Rain = "rain"
+    Snow = "snow"
+
+
 DEFAULT_WEATHER = {
-    "clear": {
-        "cloudy": 0.35,
-        "rainy": 0.05,
-        "clear": 0.5,
+    WeatherType.Clear: {
+        WeatherType.Cloudy: 0.35,
+        WeatherType.Rain: 0.05,
+        WeatherType.Clear: 0.5,
     },
-    "cloudy": {
-        "cloudy": 0.25,
-        "rainy": 0.50,
-        "clear": 0.25,
+    WeatherType.Cloudy: {
+        WeatherType.Cloudy: 0.25,
+        WeatherType.Rain: 0.50,
+        WeatherType.Clear: 0.25,
     },
-    "rainy": {
-        "cloudy": 0.35,
-        "rainy": 0.1,
-        "clear": 0.55,
+    WeatherType.Rain: {
+        WeatherType.Cloudy: 0.35,
+        WeatherType.Rain: 0.1,
+        WeatherType.Clear: 0.55,
     }
 }
 
-class BiomeEnum(StrEnum):
-    Plains = "plains"
-    Forest = "forest"
-    Coast = "coast"
-    Desert = "desert"
-    Hills = "hills"
-    Mountains = "mountains"
+class WeatherTracker:
+    def __init__(self):
+        self.daily_weather: list[WeatherType] = []
+        self.rain_events: list[float] = []
+
+    def total_rainfall(self) -> float:
+        return sum(self.rain_events)
 
 
 class GameWeatherStateMachine:
@@ -49,14 +60,15 @@ class GameWeatherStateMachine:
         return next_state
 
 
-weather = GameWeatherStateMachine()
-humidity = random.random()
-for i in range(100):
-    print(weather.current_state, humidity)
-    print(DEFAULT_WEATHER.get(weather.current_state))
-    weather.current_state = weather.transition(DEFAULT_WEATHER, humidity)
-    if weather.current_state == "rainy":
-        humidity = 0.0
-    else:
-        humidity += random.random() * 0.1
-    time.sleep(0.1)
+weather = GameWeatherStateMachine(BiomeEnum.Plains, initial_state='clear')
+annual_days = 112  # 4 months of 28 days each
+climate = Climate(annual_days)
+for year in range(55):
+    for day_number in range(annual_days):
+        if weather.current_state != WeatherType.Rain:
+            climate.update_humidity(day_number)
+        weather.current_state = weather.transition(DEFAULT_WEATHER, climate.humidity)
+        if weather.current_state == "rainy":
+            daily_rainfall = climate.rainfall()
+            climate.humidity = 0.0
+        time.sleep(0.1)
