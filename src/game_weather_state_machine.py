@@ -1,5 +1,6 @@
 import random
 import time
+from enum import StrEnum
 
 DEFAULT_WEATHER = {
     "clear": {
@@ -19,8 +20,18 @@ DEFAULT_WEATHER = {
     }
 }
 
+class BiomeEnum(StrEnum):
+    Plains = "plains"
+    Forest = "forest"
+    Coast = "coast"
+    Desert = "desert"
+    Hills = "hills"
+    Mountains = "mountains"
+
+
 class GameWeatherStateMachine:
-    def __init__(self, initial_state: str = 'clear'):
+    def __init__(self, biome: BiomeEnum, initial_state: str = 'clear'):
+        self.biome = biome
         self.states: list[str] = []
         self.transitions: dict[str, dict] = {}
         self.current_state: str = initial_state
