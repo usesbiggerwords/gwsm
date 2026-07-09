@@ -1,16 +1,15 @@
 import math
-import random
 
 
 class Climate:
 
     days_in_year: int
-    humidity: float = random.random()
+    # humidity: float = random.random()
 
     @classmethod
-    def initialize(cls, days_in_year: int, humidity: float):
+    def initialize(cls, days_in_year: int):
         cls.days_in_year = days_in_year
-        cls.humidity = humidity
+        # cls.humidity = humidity
 
     @classmethod
     def global_oscillator(cls, day_counter: int) -> float:
