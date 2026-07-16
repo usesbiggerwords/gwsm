@@ -1,5 +1,5 @@
 """
-map_generator.py
+map_generation.py
 
 Procedural ASCII map generator for the weather/food world sim.
 
@@ -13,17 +13,18 @@ Tile legend:
     V = village
     C = city
 
-Design goal:
-    Generate compact geographic regions like:
-        mmmmhhhhpppffffppppp
-        mmmhhhppphhpffffpppp
-        ...
+Generation architecture:
+    1. elevation layer
+    2. moisture layer
+    3. river layer, generated from elevation but kept separate
+    4. terrain layer, using lower mountain/hill cutoffs than the first draft
+    5. river layer merged down for rendering/gameplay
+    6. settlement layer
 
-    The generated world is intentionally simple and game-facing:
-        terrain -> rivers -> biome tiles -> settlements
-
-    This file does not depend on biome2.py yet. The intended next step is to
-    instantiate a Biome object per tile based on tile.kind.
+The important change from the first draft is that rivers are no longer owned by
+terrain tiles while they are being generated. They are generated on a separate
+river layer from high-elevation sources toward edge destinations, then merged
+back into the visible map.
 """
 
 from __future__ import annotations
@@ -65,27 +66,43 @@ class Tile:
         return self.kind.value
 
     @property
-    def is_land(self) -> bool:
-        return self.kind not in {TileKind.River}
-
-    @property
     def is_settleable(self) -> bool:
         return self.kind in {TileKind.Plains, TileKind.Forest, TileKind.Hills} and not self.has_river
 
 
 class WorldMap:
-    def __init__(self, width: int = 20, height: int = 12, seed: int | None = None):
+    def __init__(
+        self,
+        width: int = 40,
+        height: int = 20,
+        seed: int | None = None,
+        mountain_percentile: float = 0.95,
+        hill_percentile: float = 0.80,
+        river_count_min: int = 2,
+        river_count_max: int = 3,
+    ):
         if width < 8 or height < 8:
-            raise ValueError("WorldMap needs at least 8x8 to generate coherent blobs and rivers.")
+            raise ValueError("WorldMap needs at least 8x8 to generate coherent terrain and rivers.")
 
         self.width = width
         self.height = height
         self.seed = seed
         self.rng = Random(seed)
+
+        # New terrain cutoffs: much less mountainous than the first draft.
+        self.mountain_percentile = mountain_percentile
+        self.hill_percentile = hill_percentile
+
+        self.river_count_min = river_count_min
+        self.river_count_max = max(river_count_min, river_count_max)
+
         self.tiles: list[list[Tile]] = [
             [Tile(x=x, y=y) for x in range(width)]
             for y in range(height)
         ]
+
+        # Separate layer; merged into Tile.has_river after terrain is assigned.
+        self.river_layer: set[tuple[int, int]] = set()
 
     def __getitem__(self, pos: tuple[int, int]) -> Tile:
         x, y = pos
@@ -110,47 +127,41 @@ class WorldMap:
                     yield self.tiles[ny][nx]
 
     def generate(self) -> WorldMap:
-        """Run the full map generation pipeline."""
         self._generate_elevation()
         self._generate_moisture()
+        self._generate_river_layer()
         self._assign_base_terrain()
+        self._merge_river_layer()
         self._grow_forests()
-        self._carve_rivers()
         self._apply_river_valley_effects()
         self._place_settlements()
         return self
 
     # ------------------------------------------------------------------
-    # Terrain generation
+    # Terrain layers
     # ------------------------------------------------------------------
 
     def _generate_elevation(self) -> None:
-        """
-        Generate elevation by combining random noise with several mountain blobs.
-
-        The west/northwest side is slightly biased upward. This tends to create
-        mountain chains and river sources on one side of the map, like the sample
-        ASCII layout.
-        """
         elevation = [
-            [self.rng.random() * 0.35 for _ in range(self.width)]
+            [self.rng.random() * 0.28 for _ in range(self.width)]
             for _ in range(self.height)
         ]
 
-        # Broad west/north elevation bias.
+        # Broad continental slope: west/northwest tends high, east/southeast tends low.
+        # This gives rivers a consistent reason to cross the map instead of dying early.
         for y in range(self.height):
             for x in range(self.width):
-                west_bias = 1.0 - (x / max(1, self.width - 1))
-                north_bias = 1.0 - (y / max(1, self.height - 1))
-                elevation[y][x] += 0.32 * west_bias + 0.12 * north_bias
+                west = 1.0 - (x / max(1, self.width - 1))
+                north = 1.0 - (y / max(1, self.height - 1))
+                elevation[y][x] += 0.42 * west + 0.14 * north
 
-        # Mountain/hill blobs.
-        blob_count = max(3, (self.width * self.height) // 85)
+        # Fewer, broader uplift regions. The percentile cutoffs will keep true mountains rare.
+        blob_count = max(2, (self.width * self.height) // 180)
         for _ in range(blob_count):
             cx = self.rng.randrange(0, max(1, self.width // 2 + 2))
             cy = self.rng.randrange(0, self.height)
-            radius = self.rng.uniform(3.0, 6.5)
-            strength = self.rng.uniform(0.45, 0.85)
+            radius = self.rng.uniform(4.0, 8.5)
+            strength = self.rng.uniform(0.35, 0.75)
 
             for y in range(self.height):
                 for x in range(self.width):
@@ -165,32 +176,25 @@ class WorldMap:
                 self.tiles[y][x].elevation = elevation[y][x]
 
     def _generate_moisture(self) -> None:
-        """
-        Generate broad moisture pattern.
-
-        Moisture is higher near rivers later, but this initial pass lets forests
-        and deserts exist before rivers are carved.
-        """
         moisture = [
-            [self.rng.random() * 0.45 for _ in range(self.width)]
+            [self.rng.random() * 0.42 for _ in range(self.width)]
             for _ in range(self.height)
         ]
 
-        # East/southeast can be slightly drier, encouraging desert tiles there.
         for y in range(self.height):
             for x in range(self.width):
                 east = x / max(1, self.width - 1)
                 south = y / max(1, self.height - 1)
-                moisture[y][x] += 0.35 * (1.0 - east) + 0.10 * (1.0 - south)
-                moisture[y][x] -= 0.22 * east * south
+                moisture[y][x] += 0.32 * (1.0 - east)
+                moisture[y][x] += 0.08 * (1.0 - south)
+                moisture[y][x] -= 0.18 * east * south
 
-        # Forest/moisture blobs.
-        blob_count = max(4, (self.width * self.height) // 70)
+        blob_count = max(3, (self.width * self.height) // 120)
         for _ in range(blob_count):
             cx = self.rng.randrange(0, self.width)
             cy = self.rng.randrange(0, self.height)
-            radius = self.rng.uniform(2.5, 5.0)
-            strength = self.rng.uniform(0.25, 0.55)
+            radius = self.rng.uniform(3.0, 6.5)
+            strength = self.rng.uniform(0.20, 0.50)
 
             for y in range(self.height):
                 for x in range(self.width):
@@ -208,10 +212,10 @@ class WorldMap:
         elevations = sorted(tile.elevation for row in self.tiles for tile in row)
         moistures = sorted(tile.moisture for row in self.tiles for tile in row)
 
-        mountain_cutoff = self._percentile(elevations, 0.84)
-        hill_cutoff = self._percentile(elevations, 0.62)
-        dry_cutoff = self._percentile(moistures, 0.16)
-        forest_cutoff = self._percentile(moistures, 0.64)
+        mountain_cutoff = self._percentile(elevations, self.mountain_percentile)
+        hill_cutoff = self._percentile(elevations, self.hill_percentile)
+        dry_cutoff = self._percentile(moistures, 0.14)
+        forest_cutoff = self._percentile(moistures, 0.66)
 
         for row in self.tiles:
             for tile in row:
@@ -227,93 +231,162 @@ class WorldMap:
                     tile.kind = TileKind.Plains
 
     def _grow_forests(self) -> None:
-        """Make forests more contiguous by spreading from existing forest tiles."""
         for _ in range(2):
             to_forest: list[Tile] = []
             for row in self.tiles:
                 for tile in row:
-                    if tile.kind != TileKind.Plains:
+                    if tile.kind != TileKind.Plains or tile.has_river:
                         continue
                     forest_neighbors = sum(1 for n in self.neighbors8(tile.x, tile.y) if n.kind == TileKind.Forest)
-                    if forest_neighbors >= 3 and self.rng.random() < 0.65:
+                    if forest_neighbors >= 3 and self.rng.random() < 0.55:
                         to_forest.append(tile)
-                    elif forest_neighbors >= 2 and tile.moisture > 0.55 and self.rng.random() < 0.35:
+                    elif forest_neighbors >= 2 and tile.moisture > 0.58 and self.rng.random() < 0.25:
                         to_forest.append(tile)
             for tile in to_forest:
                 tile.kind = TileKind.Forest
 
     # ------------------------------------------------------------------
-    # Rivers
+    # River layer generation
     # ------------------------------------------------------------------
 
-    def _carve_rivers(self) -> None:
-        mountain_tiles = [tile for row in self.tiles for tile in row if tile.kind == TileKind.Mountain]
-        if not mountain_tiles:
+    def _generate_river_layer(self) -> None:
+        """
+        Generate rivers on a separate layer.
+
+        Rivers start on high ground and route toward a random edge destination.
+        They prefer downhill movement, but they are allowed to cross shallow rises
+        so they don't peter out after a few tiles.
+        """
+        source_pool = self._high_elevation_sources()
+        if not source_pool:
             return
 
-        mountain_tiles.sort(key=lambda t: t.elevation, reverse=True)
-        river_count = max(1, min(4, (self.width * self.height) // 80))
-        sources = mountain_tiles[: max(river_count * 3, river_count)]
-        self.rng.shuffle(sources)
+        river_count = self._river_count()
+        self.rng.shuffle(source_pool)
 
-        for source in sources[:river_count]:
-            self._carve_single_river(source)
+        selected_sources: list[Tile] = []
+        for source in source_pool:
+            if all(self._manhattan(source, other) >= 6 for other in selected_sources):
+                selected_sources.append(source)
+            if len(selected_sources) >= river_count:
+                break
 
-    def _carve_single_river(self, source: Tile) -> None:
+        if not selected_sources:
+            selected_sources = source_pool[:river_count]
+
+        for source in selected_sources:
+            destination = self._choose_river_destination(source)
+            self._trace_river_path(source, destination)
+
+    def _high_elevation_sources(self) -> list[Tile]:
+        elevations = sorted(tile.elevation for row in self.tiles for tile in row)
+        cutoff = self._percentile(elevations, 0.86)
+        sources = [
+            tile
+            for row in self.tiles
+            for tile in row
+            if tile.elevation >= cutoff and not self._is_map_edge(tile.x, tile.y)
+        ]
+        sources.sort(key=lambda tile: tile.elevation, reverse=True)
+        return sources
+
+    def _river_count(self) -> int:
+        area = self.width * self.height
+        if area < 300:
+            upper = min(self.river_count_max, 2)
+        elif area < 700:
+            upper = min(self.river_count_max, 3)
+        else:
+            upper = self.river_count_max
+        return self.rng.randint(self.river_count_min, upper)
+
+    def _choose_river_destination(self, source: Tile) -> tuple[int, int]:
+        edge_tiles: list[Tile] = []
+        for x in range(self.width):
+            edge_tiles.append(self.tiles[0][x])
+            edge_tiles.append(self.tiles[self.height - 1][x])
+        for y in range(1, self.height - 1):
+            edge_tiles.append(self.tiles[y][0])
+            edge_tiles.append(self.tiles[y][self.width - 1])
+
+        # Prefer lower edge destinations and destinations far from the source.
+        def score(tile: Tile) -> float:
+            distance = self._manhattan(source, tile)
+            low = 1.0 - tile.elevation
+            east_or_south = (tile.x / max(1, self.width - 1)) + (tile.y / max(1, self.height - 1))
+            return distance * 0.18 + low * 2.0 + east_or_south * 0.35 + self.rng.uniform(-0.25, 0.25)
+
+        edge_tiles.sort(key=score, reverse=True)
+        chosen = edge_tiles[0]
+        return chosen.x, chosen.y
+
+    def _trace_river_path(self, source: Tile, destination: tuple[int, int]) -> None:
         current = source
         visited: set[tuple[int, int]] = set()
-        max_steps = self.width + self.height + 20
+        max_steps = self.width + self.height + max(self.width, self.height)
 
-        for _ in range(max_steps):
-            visited.add((current.x, current.y))
+        for step in range(max_steps):
+            pos = (current.x, current.y)
+            already_river = pos in self.river_layer
+            visited.add(pos)
 
-            if current.kind not in {TileKind.Mountain}:
-                current.has_river = True
-
-            if self._is_map_edge(current.x, current.y):
+            # Merge into an existing river only after this river has a real length.
+            # Check this before adding the current position, otherwise every river
+            # would accidentally merge into itself.
+            if step > 6 and already_river:
                 return
 
-            if self._adjacent_to_existing_river(current) and current is not source:
-                current.has_river = True
+            # Do not erase the source mountain visually unless the river has left it.
+            if step > 0 or current.kind != TileKind.Mountain:
+                self.river_layer.add(pos)
+
+            if self._is_map_edge(current.x, current.y):
                 return
 
             candidates = [n for n in self.neighbors8(current.x, current.y) if (n.x, n.y) not in visited]
             if not candidates:
                 return
 
-            # Prefer downhill movement, but also bias generally east/south to produce
-            # long river valleys across the map.
-            def river_score(tile: Tile) -> float:
+            dx, dy = destination
+
+            def path_score(tile: Tile) -> float:
+                dist_now = abs(current.x - dx) + abs(current.y - dy)
+                dist_next = abs(tile.x - dx) + abs(tile.y - dy)
+                distance_gain = dist_now - dist_next
+
                 downhill = current.elevation - tile.elevation
-                east_bias = tile.x / max(1, self.width - 1)
-                south_bias = tile.y / max(1, self.height - 1)
-                noise = self.rng.uniform(-0.05, 0.05)
-                return downhill + (0.08 * east_bias) + (0.05 * south_bias) + noise
+                uphill_penalty = max(0.0, tile.elevation - current.elevation)
 
-            candidates.sort(key=river_score, reverse=True)
-            next_tile = candidates[0]
+                # River wants to reach destination and flow downhill, but destination
+                # pressure prevents it from dying in local basins.
+                score = 0.0
+                score += distance_gain * 1.20
+                score += downhill * 2.50
+                score -= uphill_penalty * 1.75
+                score += tile.moisture * 0.10
+                score += self.rng.uniform(-0.08, 0.08)
+                return score
 
-            # If fully trapped uphill, still move to the least bad neighbor.
-            current = next_tile
+            candidates.sort(key=path_score, reverse=True)
+            current = candidates[0]
 
-    def _adjacent_to_existing_river(self, tile: Tile) -> bool:
-        return any(n.has_river for n in self.neighbors8(tile.x, tile.y))
+    def _merge_river_layer(self) -> None:
+        for x, y in self.river_layer:
+            if self.in_bounds(x, y):
+                self.tiles[y][x].has_river = True
 
     def _apply_river_valley_effects(self) -> None:
-        """Rivers make neighboring tiles wetter and often more fertile/plains-like."""
         river_tiles = [tile for row in self.tiles for tile in row if tile.has_river]
 
         for river in river_tiles:
             for tile in self.neighbors8(river.x, river.y):
                 tile.moisture += 0.25
-                tile.fertility += 0.35
+                tile.fertility += 0.40
 
-                # Deserts adjacent to rivers become plains/floodplain.
                 if tile.kind == TileKind.Desert:
                     tile.kind = TileKind.Plains
 
-                # Hills adjacent to rivers can produce settled valleys.
-                if tile.kind == TileKind.Hills and self.rng.random() < 0.20:
+                if tile.kind == TileKind.Hills and self.rng.random() < 0.18:
                     tile.kind = TileKind.Plains
 
     # ------------------------------------------------------------------
@@ -328,14 +401,12 @@ class WorldMap:
         scored = [(self._settlement_score(tile), tile) for tile in candidates]
         scored.sort(key=lambda item: item[0], reverse=True)
 
-        # City on the best food/water hub.
         city_tile = scored[0][1]
         city_tile.settlement = TileKind.City
 
-        # Village on a good secondary site, away from the city.
         for _, tile in scored[1:]:
             dist = abs(tile.x - city_tile.x) + abs(tile.y - city_tile.y)
-            if dist >= max(4, min(self.width, self.height) // 3):
+            if dist >= max(5, min(self.width, self.height) // 3):
                 tile.settlement = TileKind.Village
                 break
 
@@ -357,12 +428,11 @@ class WorldMap:
         hill_neighbors = sum(1 for n in self.neighbors8(tile.x, tile.y) if n.kind == TileKind.Hills)
         mountain_neighbors = sum(1 for n in self.neighbors8(tile.x, tile.y) if n.kind == TileKind.Mountain)
 
-        score += river_neighbors * 2.5
-        score += forest_neighbors * 0.4
+        score += river_neighbors * 2.75
+        score += forest_neighbors * 0.35
         score += hill_neighbors * 0.25
         score += mountain_neighbors * 0.15
 
-        # Avoid edge cities unless they are otherwise excellent.
         if self._is_map_edge(tile.x, tile.y):
             score -= 1.5
 
@@ -388,7 +458,6 @@ class WorldMap:
 
     @classmethod
     def from_ascii(cls, ascii_map: str) -> WorldMap:
-        """Create a WorldMap from a hand-written ASCII map."""
         lines = [line.rstrip() for line in ascii_map.strip().splitlines() if line.strip()]
         height = len(lines)
         width = max(len(line) for line in lines)
@@ -400,6 +469,7 @@ class WorldMap:
                 if char == TileKind.River.value:
                     tile.kind = TileKind.Plains
                     tile.has_river = True
+                    world.river_layer.add((x, y))
                 elif char == TileKind.Village.value:
                     tile.kind = TileKind.Plains
                     tile.settlement = TileKind.Village
@@ -415,6 +485,10 @@ class WorldMap:
 
     def _is_map_edge(self, x: int, y: int) -> bool:
         return x == 0 or y == 0 or x == self.width - 1 or y == self.height - 1
+
+    @staticmethod
+    def _manhattan(a: Tile, b: Tile) -> int:
+        return abs(a.x - b.x) + abs(a.y - b.y)
 
     @staticmethod
     def _percentile(values: list[float], q: float) -> float:
@@ -448,12 +522,12 @@ class WorldMap:
         return current
 
 
-def generate_map(width: int = 20, height: int = 12, seed: int | None = None) -> WorldMap:
+def generate_map(width: int = 40, height: int = 20, seed: int | None = None) -> WorldMap:
     return WorldMap(width=width, height=height, seed=seed).generate()
 
 
 def main() -> None:
-    world = generate_map(width=20, height=12, seed=7)
+    world = generate_map(width=40, height=20, seed=7)
     world.print()
     print()
     print(world.counts())
