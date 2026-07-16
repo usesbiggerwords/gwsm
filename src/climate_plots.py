@@ -60,7 +60,7 @@ def _history_to_series(biome: Any) -> dict[str, list[float]]:
 
     for stat in history:
         years.append(int(stat.year))
-        rainfall.append(float(stat.rainfall))
+        rainfall.append(float(stat.available_water))
         rain_events.append(float(stat.rain_events))
 
         if soil_capacity > 0.0:
@@ -141,8 +141,8 @@ def plot_biome_dashboard(
     fig.suptitle(f"{biome_name.title()} Climate Dashboard", fontsize=16)
 
     # 1. Rainfall
-    axes[0].bar(years, rainfall, alpha=0.35, label="Annual rainfall")
-    axes[0].plot(years, rainfall_ma, linewidth=2.5, label=f"{rolling_window}Y rainfall avg")
+    axes[0].bar(years, rainfall, color="lightblue", linewidth=1.5, alpha=0.25, label="Annual rainfall")
+    axes[0].plot(years, rainfall_ma, color="blue", linewidth=3.0, label=f"{rolling_window}Y rainfall avg")
     axes[0].set_ylabel("Rainfall, in")
     axes[0].legend(loc="upper right")
     axes[0].grid(alpha=0.25)
@@ -153,6 +153,26 @@ def plot_biome_dashboard(
     axes[1].axhline(75, linestyle="--", linewidth=1.0, label="normal threshold")
     axes[1].axhline(50, linestyle="--", linewidth=1.0, label="dry threshold")
     axes[1].axhline(25, linestyle="--", linewidth=1.0, label="drought threshold")
+    axes[1].axhspan(
+        0,
+        25,
+        alpha=0.15,
+        color="red"
+    )
+
+    axes[1].axhspan(
+        25,
+        50,
+        alpha=0.10,
+        color="orange"
+    )
+
+    axes[1].axhspan(
+        50,
+        75,
+        alpha=0.05,
+        color="yellow"
+    )
     axes[1].set_ylabel("Soil, % full")
     axes[1].set_ylim(0, 105)
     axes[1].legend(loc="upper right")
@@ -176,6 +196,9 @@ def plot_biome_dashboard(
     axes[3].set_ylabel("Water, in")
     axes[3].legend(loc="upper right")
     axes[3].grid(alpha=0.25)
+
+    # 4. Agricultural yield
+
 
     plt.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(file_path, dpi=dpi, bbox_inches="tight")
